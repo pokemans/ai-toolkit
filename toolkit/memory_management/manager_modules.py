@@ -183,7 +183,22 @@ class _BouncingLinearFn(torch.autograd.Function):
 
         torch.cuda.current_stream().wait_event(ev_tx_f)
         ev_cu_s.record()
-        out = F.linear(x, w_bufs[idx], b_bufs[idx])
+        # Ensure weight/bias are on the same device as input `x` to avoid
+        # "Expected all tensors to be on the same device" runtime errors.
+        w = w_bufs[idx]
+        b = b_bufs[idx]
+        if w is not None and w.device != x.device:
+            try:
+                w = w.to(x.device, non_blocking=True)
+            except Exception:
+                w = w.to(x.device)
+            if b is not None and b.device != x.device:
+                try:
+                    b = b.to(x.device, non_blocking=True)
+                except Exception:
+                    b = b.to(x.device)
+
+        out = F.linear(x, w, b)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.device = device
@@ -363,7 +378,21 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         torch.cuda.current_stream().wait_event(ev_tx_f)
         ev_cu_s.record()
-        out = F.conv2d(x, w_bufs[idx], b_bufs[idx], stride, padding, dilation, groups)
+        # Ensure weight/bias are on same device as `x` to avoid device-mismatch
+        w = w_bufs[idx]
+        b = b_bufs[idx]
+        if w is not None and w.device != x.device:
+            try:
+                w = w.to(x.device, non_blocking=True)
+            except Exception:
+                w = w.to(x.device)
+            if b is not None and b.device != x.device:
+                try:
+                    b = b.to(x.device, non_blocking=True)
+                except Exception:
+                    b = b.to(x.device)
+
+        out = F.conv2d(x, w, b, stride, padding, dilation, groups)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.meta = (device, stride, padding, dilation, groups, target_dtype)

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 import torch
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from PIL import Image
+from toolkit.memory_management.manager import MemoryManager
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from diffusers import AutoencoderKL
@@ -149,6 +150,14 @@ class ChromaModel(BaseModel):
         self.print_and_status_update("Loading transformer")
         
         chroma_state_dict = load_file(model_path, 'cpu')
+
+        # cast loaded tensors to the model dtype
+        for k in list(chroma_state_dict.keys()):
+            try:
+                chroma_state_dict[k] = chroma_state_dict[k].to(dtype)
+            except Exception:
+                # some entries may not be tensors or may fail; skip those
+                pass
         
         # determine number of double and single blocks
         double_blocks = 0
@@ -173,26 +182,45 @@ class ChromaModel(BaseModel):
         transformer.dtype = dtype
         # load the state dict into the model
         transformer.load_state_dict(chroma_state_dict)
-        
-        transformer.to(self.quantize_device, dtype=dtype)
+
+        del chroma_state_dict  # free memory
+        flush()
+
+        if not self.model_config.low_vram:
+            transformer.to(self.quantize_device, dtype=dtype)
+        else:
+            transformer.to('cpu', dtype=dtype)
         
         transformer.config = FakeConfig()
         transformer.config.num_layers = double_blocks
         transformer.config.num_single_layers = single_blocks
 
         if self.model_config.quantize:
-            # patch the state dict method
             patch_dequantization_on_save(transformer)
             quantization_type = get_qtype(self.model_config.qtype)
             self.print_and_status_update("Quantizing transformer")
             quantize(transformer, weights=quantization_type,
                      **self.model_config.quantize_kwargs)
             freeze(transformer)
-            transformer.to(self.device_torch)
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
+            flush()
 
+        if self.model_config.low_vram:
+            transformer.to('cpu')
+        else:
+            transformer.to(self.device_torch)
+
+        torch.compile(transformer)
         flush()
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_transformer_percent > 0
+        ):
+            MemoryManager.attach(
+                transformer,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_transformer_percent,
+            )
 
         self.print_and_status_update("Loading T5")
         tokenizer_2 = T5TokenizerFast.from_pretrained(
@@ -201,20 +229,40 @@ class ChromaModel(BaseModel):
         text_encoder_2 = T5EncoderModel.from_pretrained(
             extras_path, subfolder="text_encoder_2", torch_dtype=dtype
         )
-        text_encoder_2.to(self.device_torch, dtype=dtype)
-        flush()
+        if not self.model_config.low_vram:
+            text_encoder_2.to(self.device_torch, dtype=dtype)
+        else: text_encoder_2.to('cpu', dtype=dtype)
 
+        # quantize TE if requested. perform quantization on the quantize
+        # device for speed, then return to CPU when low_vram is enabled.
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing T5")
-            quantize(text_encoder_2, weights=get_qtype(
-                self.model_config.qtype))
+            # quantize routine is responsible for device placement
+            quantize(text_encoder_2, weights=get_qtype(self.model_config.qtype))
             freeze(text_encoder_2)
             flush()
+
+        # final placement for TE
+        if self.model_config.layer_offloading:
+            text_encoder_2.to('cpu')
+        elif not self.model_config.low_vram:
+            text_encoder_2.to(self.device_torch)
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_text_encoder_percent > 0
+        ):
+            MemoryManager.attach(
+                text_encoder_2,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+            )
+
+        flush()
 
         # self.print_and_status_update("Loading CLIP")
         text_encoder = FakeCLIP()
         tokenizer = FakeCLIP()
-        text_encoder.to(self.device_torch, dtype=dtype)
 
         self.noise_scheduler = ChromaModel.get_train_scheduler()
         
@@ -224,7 +272,10 @@ class ChromaModel(BaseModel):
             subfolder="vae",
             torch_dtype=dtype
         )
-        vae = vae.to(self.device_torch, dtype=dtype)
+        if not self.model_config.low_vram:
+            vae = vae.to(self.device_torch, dtype=dtype)
+        else:
+            vae = vae.to('cpu')
 
         self.print_and_status_update("Making pipe")
 
@@ -246,17 +297,27 @@ class ChromaModel(BaseModel):
         text_encoder = [pipe.text_encoder, pipe.text_encoder_2]
         tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
 
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        if not self.model_config.low_vram:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
         # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
+        if not self.model_config.low_vram:
+            text_encoder[0].to(self.device_torch)
+        else:
+            text_encoder[0].to('cpu')
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
-        text_encoder[1].to(self.device_torch)
+        if not self.model_config.low_vram:
+            text_encoder[1].to(self.device_torch)
+        else:
+            text_encoder[1].to('cpu')
         text_encoder[1].requires_grad_(False)
         text_encoder[1].eval()
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        if not self.model_config.low_vram:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
+        else:
+            pipe.transformer = pipe.transformer.to('cpu')
         flush()
 
         # save it to the model class

@@ -165,7 +165,7 @@ class Chroma(nn.Module):
         # self.mod_index = torch.tensor(list(range(self.mod_index_length)), device=0)
         self.register_buffer(
             "mod_index",
-            torch.tensor(list(range(self.mod_index_length)), device="cpu"),
+            torch.tensor(list(range(self.mod_index_length))),
             persistent=False,
         )
         self.approximator_in_dim = params.approximator_in_dim
@@ -206,8 +206,10 @@ class Chroma(nn.Module):
             distill_timestep = timestep_embedding(timesteps, 16)
             # TODO: need to add toggle to omit this from schnell but that's not a priority
             distil_guidance = timestep_embedding(guidance, 16)
+            # ensure mod_index is on the same device as timesteps
+            mod_idx = self.mod_index.to(timesteps.device, non_blocking=True)
             # get all modulation index
-            modulation_index = timestep_embedding(self.mod_index, 32)
+            modulation_index = timestep_embedding(mod_idx, 32)
             # we need to broadcast the modulation index here so each batch has all of the index
             modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1)
             # and we need to broadcast timestep and guidance along too
